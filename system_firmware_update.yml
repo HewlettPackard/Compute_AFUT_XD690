@@ -2,20 +2,24 @@
 - hosts: xds
   gather_facts: yes
   connection: local
-  name: version 1.0 System Firmware Update for HPE Cray XD690 systems
-  
+  # 'free' lets each host race ahead through its own firmware sequence
+  # instead of lock-stepping with the slowest host in the batch.
+  strategy: free
+  name: version 1.0 Ordered Multi-Firmware Update for HPE Cray XD690 systems
+
   vars:
      bmc_username: "{{ inputs[inventory_hostname].user }}"
      bmc_password: "{{ inputs[inventory_hostname].password }}"
      baseuri: "{{ ansible_ssh_host }}"
- 
-  tasks:    
-    - name: System Firmware Update Status result will be uploaded to the below json file
-      set_fact: 
-        output_file: "System_FW_Update_{{ ansible_date_time.date }}_{{ ansible_date_time.time }}.json"
-      run_once: True
-   
-    - name: Running Firmware Update for Cray XD Servers
+
+  tasks:
+    - name: System Firmware Update Status result will be uploaded to a per-host json file
+      # One file per host (not run_once/shared) so concurrent hosts never
+      # read-modify-write the same json file at the same time.
+      set_fact:
+        output_file: "System_FW_Update_{{ inventory_hostname }}_{{ ansible_date_time.date }}_{{ ansible_date_time.time | regex_replace(':','-') }}.json"
+
+    - name: Flash the ordered firmware list from config.ini on this host
       update_system_firmware:
         category: Update
         command: ["SystemFirmwareUpdate"]
@@ -24,6 +28,7 @@
         password: "{{ bmc_password }}"
         output_file_name: "{{ output_file }}"
       register: system_fw_update_output
+
 
     - name: Firmware update module result
       debug:
