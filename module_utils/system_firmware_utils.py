@@ -354,6 +354,10 @@ class CrayRedfishUtils(RedfishUtils):
                 if model_val:
                     model = str(model_val).strip()
                     if model != "NA":
+                        # Remember which URI actually resolves on this BMC - some
+                        # platforms don't expose a 'Self' alias, so power actions
+                        # elsewhere shouldn't hardcode it.
+                        self._system_uri = system_uri
                         break
             except Exception:
                 continue
@@ -367,6 +371,14 @@ class CrayRedfishUtils(RedfishUtils):
                 if "XD" in dum:
                     partial_models[model.upper()]=dum.upper()
         return model
+
+    def _system_resource_uri(self):
+        """Return the /redfish/v1/Systems/<id> path that actually resolves on
+        this BMC, discovering it via get_model() if not already cached.
+        """
+        if not getattr(self, '_system_uri', None):
+            self.get_model()
+        return getattr(self, '_system_uri', None) or "/redfish/v1/Systems/Self"
 
     def get_firmware_inventory_collection(self):
         """Return FirmwareInventory as a dict of {Name: Version}.
@@ -411,7 +423,7 @@ class CrayRedfishUtils(RedfishUtils):
         return {'ret': True, 'inventory': inventory}
 
     def power_state(self):
-        response = self.get_request(self.root_uri + "/redfish/v1/Systems/Self")
+        response = self.get_request(self.root_uri + self._system_resource_uri())
         if response['ret'] is False:
             return "NA"
         state='None'
@@ -425,13 +437,13 @@ class CrayRedfishUtils(RedfishUtils):
 
     def power_on(self):
         payload = {"ResetType": "On"}
-        target_uri = "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset"
+        target_uri = self._system_resource_uri() + "/Actions/ComputerSystem.Reset"
         response1 = self.post_request(self.root_uri + target_uri, payload)
         time.sleep(120)
 
     def power_off(self):
         payload = {"ResetType": "ForceOff"}
-        target_uri = "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset"
+        target_uri = self._system_resource_uri() + "/Actions/ComputerSystem.Reset"
         response1 = self.post_request(self.root_uri + target_uri, payload)
         time.sleep(120)
 
@@ -439,6 +451,8 @@ class CrayRedfishUtils(RedfishUtils):
         ini_path = os.path.join(os.getcwd(),'config.ini')
         config = configparser.ConfigParser()
         IP = attr.get('baseuri')
+        username = attr.get('username')
+        password = attr.get('password')
         config.read(ini_path)
         try:
             option = config.get('Options','power_state')
@@ -466,6 +480,23 @@ class CrayRedfishUtils(RedfishUtils):
             elif option.upper()=="OFF":
                 if power_state.upper()=="ON":
                     self.power_off()
+                power_state = self.power_state()
+                lis=[IP,model,power_state]
+            elif option.upper()=="REBOOT":
+                # Redfish graceful reboot - same action used after a BIOS/CPLD update
+                self.AC_PC_redfish()
+                power_state = self.power_state()
+                lis=[IP,model,power_state]
+            elif option.upper() in ("AC_CYCLE", "AC_CYCLE_IPMI"):
+                # IPMI AC power cycle (raw 0x3c 0x99) - same action used after a CPLD update
+                if not username or not password:
+                    return {'ret': False, 'changed': True, 'msg': 'username/password are required for AC_CYCLE'}
+                cycled, cycle_msg = self.ac_cycle_ipmi(IP, username, password)
+                if not cycled:
+                    return {'ret': False, 'changed': True, 'msg': 'ac_cycle failed: %s' % cycle_msg}
+                # An AC cycle isn't instant - give the system time to actually
+                # power down/up again before reporting a (likely stale) state.
+                time.sleep(180)
                 power_state = self.power_state()
                 lis=[IP,model,power_state]
             else:
@@ -547,7 +578,7 @@ class CrayRedfishUtils(RedfishUtils):
 
     def AC_PC_redfish(self):
         payload = {"ResetType": "ForceRestart"}
-        target_uri = "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset"
+        target_uri = self._system_resource_uri() + "/Actions/ComputerSystem.Reset"
         response1 = self.post_request(self.root_uri + target_uri, payload)
         time.sleep(180)
         target_uri = "/redfish/v1/Chassis/Self/Actions/Chassis.Reset"
@@ -568,13 +599,18 @@ class CrayRedfishUtils(RedfishUtils):
     def ac_cycle_ipmi(self, IP, username, password):
         """Perform AC power cycle via IPMI raw command 0x3c 0x99.
         Used after CPLD firmware updates to activate the new firmware.
+        Returns: (success, message) - message carries ipmitool's own
+        output/error so callers aren't left guessing why it failed.
         """
+        command = 'ipmitool -I lanplus -H %s -U %s -P %s raw 0x3c 0x99' % (IP, username, password)
         try:
-            command = 'ipmitool -I lanplus -H %s -U %s -P %s raw 0x3c 0x99' % (IP, username, password)
-            subprocess.run(command, shell=True, check=True, timeout=30)
-            return True
-        except Exception:
-            return False
+            result = subprocess.run(command, shell=True, timeout=30, capture_output=True, text=True)
+            output = (result.stdout or '').strip() or (result.stderr or '').strip()
+            if result.returncode == 0:
+                return True, output or "AC cycle command accepted"
+            return False, "ipmitool exited %s: %s" % (result.returncode, output or "no output")
+        except Exception as e:
+            return False, str(e)
 
     def get_gpu_inventory(self, attr):
         """
@@ -661,7 +697,11 @@ class CrayRedfishUtils(RedfishUtils):
 
     def _is_task_completed(self, data):
         """Check if task data indicates completion (success or failure).
-        Returns: (is_done, is_success) tuple
+        Returns: (is_done, is_success) tuple. is_done is True for a confirmed
+        terminal state, or the string 'provisional' for a 100%/OK signal that
+        isn't backed by an explicit terminal TaskState yet - some BMCs report
+        this transiently before later flipping to Exception during final
+        validation, so callers should re-confirm before trusting it.
         """
         task_state = data.get('TaskState', '')
         task_status = data.get('TaskStatus', '')
@@ -674,10 +714,6 @@ class CrayRedfishUtils(RedfishUtils):
         if task_state in ('Exception', 'Killed', 'Cancelled'):
             return (True, False)
 
-        # 100% with OK status
-        if percent == 100 and task_status == 'OK':
-            return (True, True)
-
         # Check messages for completion indicators
         for msg in (messages or []):
             if not isinstance(msg, dict):
@@ -687,6 +723,10 @@ class CrayRedfishUtils(RedfishUtils):
                 return (True, True)
             if 'FirmwareUpdateCompleted' in msg_id:
                 return (True, True)
+
+        # 100% with OK status, but no explicit terminal TaskState - provisional only
+        if percent == 100 and task_status == 'OK':
+            return ('provisional', True)
 
         return (False, False)
 
@@ -741,8 +781,23 @@ class CrayRedfishUtils(RedfishUtils):
                 last_state = task_state
 
             is_done, is_success = self._is_task_completed(data)
-            if is_done:
+            if is_done is True:
                 return _build_result(data, is_success)
+            if is_done == 'provisional':
+                # Don't trust a bare 100%/OK signal immediately - give the BMC
+                # a moment to flip to Exception during final validation if
+                # it's going to, then re-check before declaring success.
+                time.sleep(20)
+                confirm_resp = self.get_request(self.root_uri + task_uri, timeout=POLL_HTTP_TIMEOUT)
+                if confirm_resp.get('ret'):
+                    confirm_data = confirm_resp.get('data') or {}
+                    confirm_done, confirm_success = self._is_task_completed(confirm_data)
+                    if confirm_done is True:
+                        return _build_result(confirm_data, confirm_success)
+                    if confirm_done == 'provisional':
+                        # Still just 100%/OK after the grace period - accept it.
+                        return _build_result(confirm_data, True)
+                # Confirmation request failed - keep polling normally.
 
             time.sleep(poll_interval)
 
@@ -859,9 +914,10 @@ class CrayRedfishUtils(RedfishUtils):
         # Snapshot firmware inventory before the upload starts. Querying a
         # target's version mid-task (after upload begins) is unreliable since
         # its FirmwareInventory record is often unavailable while transferring.
-        pre_inventory = self.get_firmware_inventory_collection()
-        if not isinstance(pre_inventory, dict) or pre_inventory.get('ret') is False:
-            pre_inventory = {}
+        # get_firmware_inventory_collection() returns {'ret':.., 'inventory': {name: version}} -
+        # unwrap it here so lookups below are against the actual name->version map.
+        pre_inventory_resp = self.get_firmware_inventory_collection()
+        pre_inventory = pre_inventory_resp.get('inventory') or {} if pre_inventory_resp.get('ret') else {}
 
         with open(image_path, 'rb') as image_path_rb:
             body['UpdateFile'] = (os.path.basename(image_path), image_path_rb, 'application/octet-stream')
@@ -884,7 +940,11 @@ class CrayRedfishUtils(RedfishUtils):
                 if self.target:
                     before_version = pre_inventory.get(self.target, "NA")
                 if self._last_task_uri:
-                    task_result = self._poll_task_completion(self._last_task_uri, timeout_seconds=1800)
+                    # 60 min - some firmware images (e.g. CPLD) can genuinely
+                    # still be "Running" past 30 min; a real timeout previously
+                    # killed an in-progress-but-healthy task and stopped the
+                    # whole ordered sequence.
+                    task_result = self._poll_task_completion(self._last_task_uri, timeout_seconds=3600)
                     if task_result.get('ret'):
                         update_status = "success"
                     else:
@@ -902,9 +962,14 @@ class CrayRedfishUtils(RedfishUtils):
                     # No task URI - assume success if POST returned OK
                     update_status = "success"
 
-                # Post-update actions per target type
+                # Post-update actions per target type - only when the task
+                # itself actually succeeded; on failure just report "NA" so a
+                # failed step never gets a misleading "pending_final_*" marker
+                # that never gets backfilled (the sequence stops on failure).
                 target_name = (self.target or "").upper()
-                if target_name == 'BMC':
+                if update_status != "success":
+                    after_version = "NA"
+                elif target_name == 'BMC':
                     # BMC reboots after update - wait 5 minutes for it to come back
                     time.sleep(300)
                     after_version = "NA"
@@ -916,38 +981,40 @@ class CrayRedfishUtils(RedfishUtils):
                         time.sleep(30)
                 elif target_name in ('BIOS', 'BIOS2'):
                     # BIOS PLDM update: after task reaches 100%, BMC automatically
-                    # performs DC cycle -> AC cycle -> flash recovery -> 2nd DC -> 2nd AC
-                    # This takes ~30 minutes. Wait then retry getting version.
-                    time.sleep(1800)  # 30 min for auto power cycles to complete
-                    after_version = "NA"
-                    for retry in range(10):
-                        ver = self.get_fw_version(self.target)
-                        if not ver.startswith("NA"):
-                            after_version = ver
-                            break
-                        time.sleep(30)
+                    # performs DC cycle -> AC cycle -> flash recovery -> 2nd DC -> 2nd AC.
+                    # Defer that wait + version check to the end of the whole ordered
+                    # sequence instead of doing it per-step, so multiple firmware in
+                    # one run only go through this settle-and-reboot once.
+                    self._pending_reboot = True
+                    after_version = "pending_final_reboot"
                 elif target_name in CPLD_TARGETS:
-                    # CPLD updates require an IPMI AC power cycle to activate
-                    # Wait before AC cycle to let BMC settle after update
-                    time.sleep(120)
-                    
-                    # Perform AC cycle via IPMI raw command 0x3c 0x99
-                    self.ac_cycle_ipmi(IP, username, password)
-                    
-                    # Wait for system to recover after AC cycle
-                    time.sleep(180)
-                    
-                    # Retry getting firmware version after AC cycle
+                    # CPLD updates require an IPMI AC power cycle to activate.
+                    # Defer the cycle + version check to the end of the whole
+                    # ordered sequence instead of doing it per-step, so multiple
+                    # CPLD entries in one run only get AC-cycled once.
+                    self._pending_ac_cycle = True
+                    after_version = "pending_final_ac_cycle"
+                elif self.target and self.target in pre_inventory:
+                    # Other single-component targets - get version immediately
+                    after_version = self.get_fw_version(self.target)
+                else:
+                    # Multi-component bundle (e.g. a GPU/HGX package touching many
+                    # FirmwareInventory entries at once) - the reported target
+                    # doesn't map to any single real component, so there's no one
+                    # version to look up. Instead, diff the whole inventory before
+                    # vs after and report every component whose version changed.
+                    before_version = {}
                     after_version = "NA"
                     for retry in range(6):
-                        ver = self.get_fw_version(self.target)
-                        if not ver.startswith("NA"):
-                            after_version = ver
+                        post_resp = self.get_firmware_inventory_collection()
+                        post_inventory = post_resp.get('inventory') or {} if post_resp.get('ret') else {}
+                        changed = {name: ver for name, ver in post_inventory.items()
+                                   if pre_inventory.get(name, "NA") != ver}
+                        if changed:
+                            before_version = {name: pre_inventory.get(name, "NA") for name in changed}
+                            after_version = changed
                             break
                         time.sleep(30)
-                else:
-                    # Other targets - get version immediately
-                    after_version = self.get_fw_version(self.target)
 
         
         return before_version, after_version, update_status
@@ -1004,10 +1071,9 @@ class CrayRedfishUtils(RedfishUtils):
         Build the ordered list of firmware image paths to flash in sequence.
 
         Looks for a model-specific section [Firmware_Order_XD690] first
-        (keys are the flash order, e.g. 1, 2, 3, ...), falls back to the generic
-        [Firmware_Order] section, and finally falls back to the single
-        update_image_path_xd690 option for backward compatibility with older
-        config.ini files.
+        (keys are the flash order, e.g. 1, 2, 3, ...), falling back to the
+        generic [Firmware_Order] section. For a single/individual firmware
+        update, just list one entry in the section (e.g. only "1 = <path>").
         """
         short_model = partial_models.get(model.upper()) if model != "NA" else None
         section_candidates = []
@@ -1026,12 +1092,6 @@ class CrayRedfishUtils(RedfishUtils):
                 if paths:
                     return paths
 
-        try:
-            value = config.get('Image', 'update_image_path_xd690')
-            if value and value.strip():
-                return [value.strip()]
-        except Exception:
-            pass
         return []
 
     def system_fw_update(self, attr):
@@ -1066,12 +1126,14 @@ class CrayRedfishUtils(RedfishUtils):
         firmware_list = self.get_firmware_order(config, model)
         if not firmware_list:
             return {'ret': False, 'changed': True,
-                     'msg': 'Must specify update_image_path_xd690 '
-                            'or a [Firmware_Order_XD690]/[Firmware_Order] section in config.ini'}
+                     'msg': 'Must specify at least one entry in the '
+                            '[Firmware_Order_XD690] (or [Firmware_Order]) section in config.ini'}
 
         total_steps = len(firmware_list)
         step_results = []
         all_succeeded = True
+        self._pending_reboot = False
+        self._pending_ac_cycle = False
 
         for step, image_path in enumerate(firmware_list, start=1):
             result_data = {
@@ -1117,6 +1179,35 @@ class CrayRedfishUtils(RedfishUtils):
                 # in the list may depend on this one having succeeded.
                 all_succeeded = False
                 break
+
+        # Perform the deferred BIOS reboot / CPLD AC-cycle once, at the end of
+        # the whole ordered sequence, instead of once per BIOS/CPLD step.
+        if all_succeeded and total_steps > 0:
+            if self._pending_reboot:
+                time.sleep(1800)  # 30 min for BMC's automatic power cycles to complete
+            if self._pending_ac_cycle:
+                time.sleep(120)  # let BMC settle after the last CPLD update
+                self.ac_cycle_ipmi(IP, username, password)
+                time.sleep(180)  # let the system recover after the AC cycle
+
+            # Backfill fw_version_after for every step that deferred its check
+            for result_data in step_results:
+                if result_data.get("fw_version_after") not in ("pending_final_reboot", "pending_final_ac_cycle"):
+                    continue
+                target = result_data.get("target")
+                final_version = "NA"
+                for retry in range(10):
+                    ver = self.get_fw_version(target)
+                    if not ver.startswith("NA"):
+                        final_version = ver
+                        break
+                    time.sleep(30)
+                result_data["fw_version_after"] = final_version
+                result_data["message"] = (
+                    f"[{result_data['step']}/{total_steps}] {target} firmware successfully updated "
+                    f"from {result_data.get('fw_version_before')} to {final_version}"
+                )
+                self._append_to_json_log(output_file_name, result_data)
 
         # Final host reboot once the whole ordered sequence has completed
         # successfully, so all flashed firmware takes effect.

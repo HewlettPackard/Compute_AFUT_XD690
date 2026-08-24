@@ -13,11 +13,17 @@
      baseuri: "{{ ansible_ssh_host }}"
 
   tasks:
+    - name: Ensure logs directory exists
+      file:
+        path: logs
+        state: directory
+      run_once: true
+
     - name: System Firmware Update Status result will be uploaded to a per-host json file
       # One file per host (not run_once/shared) so concurrent hosts never
       # read-modify-write the same json file at the same time.
       set_fact:
-        output_file: "System_FW_Update_{{ inventory_hostname }}_{{ ansible_date_time.date }}_{{ ansible_date_time.time | regex_replace(':','-') }}.json"
+        output_file: "logs/System_FW_Update_{{ inventory_hostname }}_{{ ansible_date_time.date }}_{{ ansible_date_time.time | regex_replace(':','-') }}.json"
 
     - name: Flash the ordered firmware list from config.ini on this host
       update_system_firmware:
