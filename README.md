@@ -98,7 +98,7 @@ inputs:
 
 # Scripts
 
-1. system_firmware_update.yml : Playbook to perform firmware upgrade - the list of firmware (.fwpkg) files to flash, and the order to flash them in, is set in the `[Firmware_Order_XD690]` section of config.ini
+1. system_firmware_update.yml : Playbook to perform firmware upgrade - the list of firmware (.fwpkg) files to flash, and the order to flash them in, is set in the `[Firmware_XD690]` section of config.ini
 
 2. get_system_firmware_inventory.yml : Playbook to fetch the system firmware inventory information
 
@@ -135,7 +135,7 @@ The playbook `system_firmware_update.yml` is used to perform the firmware upgrad
 
 2. Update the config.ini
 
-   - Under `[Firmware_Order_XD690]`, list the firmware files (.fwpkg) you want to flash, one per line, numbered in the order you want them flashed (1, 2, 3, ...). This works for BMC, BIOS, CPLD, and GPU/HGX firmware alike - just add the file path.
+   - Under `[Firmware_XD690]`, list the firmware files (.fwpkg) you want to flash, one per line, numbered in the order you want them flashed (1, 2, 3, ...). This works for BMC, BIOS, CPLD, and GPU/HGX firmware alike - just add the file path.
    - For a single/individual firmware update, just list one entry (e.g. only `1 = <path>`).
 
 3. Run the ansible playbook:
@@ -147,6 +147,8 @@ The playbook `system_firmware_update.yml` is used to perform the firmware upgrad
    Each firmware in the list is flashed one at a time, in order. If any of them fails, the run stops there and the remaining firmware in the list is not flashed.
 
    Once every firmware in the list has been flashed successfully, the tool automatically reboots the system (and runs an IPMI AC power cycle too, if any CPLD firmware was included) so everything takes effect - this only happens once at the very end, not after each individual firmware.
+
+   To restore the BMC to its factory-default configuration after a successful firmware update, set `restore_bmc_to_default = yes` under `[BMC_Settings]` in `config.ini`. The default is `no`. This uses the Redfish `Manager.ResetToDefaults` action with `ResetType: ResetAll`; it can reset network settings and BMC users, so use it only when those defaults are intended.
 
    Results for every step, including firmware version before/after, are saved to a JSON file under the `logs/` folder (one file per host, per run).
 

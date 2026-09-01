@@ -576,6 +576,12 @@ class CrayRedfishUtils(RedfishUtils):
         response = self.post_request(self.root_uri + target_uri, payload)
         return response
 
+    def restore_bmc_to_defaults(self):
+        """Reset the BMC configuration using the standard Redfish action."""
+        payload = {"ResetType": "ResetAll"}
+        target_uri = "/redfish/v1/Managers/BMC/Actions/Manager.ResetToDefaults"
+        return self.post_request(self.root_uri + target_uri, payload)
+
     def AC_PC_redfish(self):
         payload = {"ResetType": "ForceRestart"}
         target_uri = self._system_resource_uri() + "/Actions/ComputerSystem.Reset"
@@ -994,15 +1000,28 @@ class CrayRedfishUtils(RedfishUtils):
                     # CPLD entries in one run only get AC-cycled once.
                     self._pending_ac_cycle = True
                     after_version = "pending_final_ac_cycle"
-                elif self.target and self.target in pre_inventory:
-                    # Other single-component targets - get version immediately
-                    after_version = self.get_fw_version(self.target)
+                elif target_name.startswith('HGX'):
+                    # GPU/HGX firmware (a single member like HGX_FW_BMC_0, or an
+                    # unresolved bundle id like HGX_0) - like CPLD, these require
+                    # an AC power cycle before FirmwareInventory reflects the new
+                    # version. This was previously never scheduled here (only
+                    # BMC/BIOS/CPLD triggered a reboot/cycle), so GPU/HGX updates
+                    # silently never got power-cycled. Defer one cycle for the
+                    # whole ordered sequence, same as CPLD, instead of polling for
+                    # up to 30 min per step waiting for a cycle that hasn't
+                    # happened yet.
+                    # Track only the resolved component itself (e.g. HGX_FW_BMC_0),
+                    # not every HGX_* entry in inventory.
+                    if self.target:
+                        before_version = {self.target: pre_inventory.get(self.target, "NA")}
+                    self._pending_ac_cycle = True
+                    after_version = "pending_final_ac_cycle"
                 else:
-                    # Multi-component bundle (e.g. a GPU/HGX package touching many
-                    # FirmwareInventory entries at once) - the reported target
-                    # doesn't map to any single real component, so there's no one
-                    # version to look up. Instead, diff the whole inventory before
-                    # vs after and report every component whose version changed.
+                    # Any remaining target - a single component (PSU, PCIeSwitch,
+                    # etc.) or an otherwise-unmapped bundle. Diff the whole
+                    # inventory before vs after so one path correctly reports
+                    # either a single changed component or several, with no
+                    # divergent behavior between the two cases.
                     before_version = {}
                     after_version = "NA"
                     for retry in range(6):
@@ -1070,7 +1089,7 @@ class CrayRedfishUtils(RedfishUtils):
         """
         Build the ordered list of firmware image paths to flash in sequence.
 
-        Looks for a model-specific section [Firmware_Order_XD690] first
+        Looks for a model-specific section [Firmware_XD690] first
         (keys are the flash order, e.g. 1, 2, 3, ...), falling back to the
         generic [Firmware_Order] section. For a single/individual firmware
         update, just list one entry in the section (e.g. only "1 = <path>").
@@ -1078,7 +1097,7 @@ class CrayRedfishUtils(RedfishUtils):
         short_model = partial_models.get(model.upper()) if model != "NA" else None
         section_candidates = []
         if short_model:
-            section_candidates.append('Firmware_Order_%s' % short_model)
+            section_candidates.append('Firmware_%s' % short_model)
         section_candidates.append('Firmware_Order')
 
         for section in section_candidates:
@@ -1110,6 +1129,8 @@ class CrayRedfishUtils(RedfishUtils):
         username = attr.get('username')
         password = attr.get('password')
         output_file_name = attr.get('output_file_name')
+        restore_bmc_to_default = config.getboolean(
+            'BMC_Settings', 'restore_bmc_to_default', fallback=False)
 
         # Convert to JSON if CSV extension provided
         if output_file_name.endswith('.csv'):
@@ -1127,7 +1148,7 @@ class CrayRedfishUtils(RedfishUtils):
         if not firmware_list:
             return {'ret': False, 'changed': True,
                      'msg': 'Must specify at least one entry in the '
-                            '[Firmware_Order_XD690] (or [Firmware_Order]) section in config.ini'}
+                            '[Firmware_XD690] (or [Firmware_Order]) section in config.ini'}
 
         total_steps = len(firmware_list)
         step_results = []
@@ -1194,18 +1215,33 @@ class CrayRedfishUtils(RedfishUtils):
             for result_data in step_results:
                 if result_data.get("fw_version_after") not in ("pending_final_reboot", "pending_final_ac_cycle"):
                     continue
-                target = result_data.get("target")
-                final_version = "NA"
-                for retry in range(10):
-                    ver = self.get_fw_version(target)
-                    if not ver.startswith("NA"):
-                        final_version = ver
-                        break
-                    time.sleep(30)
+                before = result_data.get("fw_version_before")
+                if isinstance(before, dict):
+                    # Multi-component HGX/GPU target - one inventory fetch per
+                    # retry covers every tracked component instead of a
+                    # separate request per name.
+                    final_version = {name: "NA" for name in before}
+                    for retry in range(10):
+                        post_resp = self.get_firmware_inventory_collection()
+                        post_inventory = post_resp.get('inventory') or {} if post_resp.get('ret') else {}
+                        for name in before:
+                            final_version[name] = post_inventory.get(name, final_version[name])
+                        if all(not str(v).startswith("NA") for v in final_version.values()):
+                            break
+                        time.sleep(30)
+                else:
+                    target = result_data.get("target")
+                    final_version = "NA"
+                    for retry in range(10):
+                        ver = self.get_fw_version(target)
+                        if not ver.startswith("NA"):
+                            final_version = ver
+                            break
+                        time.sleep(30)
                 result_data["fw_version_after"] = final_version
                 result_data["message"] = (
-                    f"[{result_data['step']}/{total_steps}] {target} firmware successfully updated "
-                    f"from {result_data.get('fw_version_before')} to {final_version}"
+                    f"[{result_data['step']}/{total_steps}] {result_data.get('target')} firmware successfully updated "
+                    f"from {before} to {final_version}"
                 )
                 self._append_to_json_log(output_file_name, result_data)
 
@@ -1214,12 +1250,23 @@ class CrayRedfishUtils(RedfishUtils):
         if all_succeeded and total_steps > 0:
             self.AC_PC_redfish()
 
+        restore_result = None
+        if all_succeeded and total_steps > 0 and restore_bmc_to_default:
+            restore_result = self.restore_bmc_to_defaults()
+            if not restore_result.get('ret'):
+                all_succeeded = False
+
         summary = {
             "ip_address": IP,
             "model": model,
             "total_steps": total_steps,
             "completed_steps": len(step_results),
             "overall_status": "success" if all_succeeded else "failed",
+            "restore_bmc_to_default": restore_bmc_to_default,
+            "restore_bmc_to_default_status": (
+                "success" if restore_result and restore_result.get('ret')
+                else "failed" if restore_result else "skipped"
+            ),
             "steps": step_results,
         }
 
