@@ -8,11 +8,15 @@ system_credentials.yml : This file contains the credentials of the target system
 
 <br />
 
-Playbooks : Ansible playbooks are defined with the tasks required to update the different components of system firmware, fetch system firmware inventory for the supported Compute XD servers and a playbook to view power states or to power on or to power off Compute XD690 nodes.
+Playbooks : Ansible playbooks are defined with the tasks required to update the different components of system firmware, fetch system firmware and GPU inventory for the supported Compute XD servers, and to check/change power state (on, off, reboot, AC power cycle) on Compute XD690 nodes.
 
 <br />
 
 Run the Playbooks : Execute the playbook using the ansible-playbook command, providing the inventory file and the playbook file as arguments. Ansible will connect to the target systems specified in the inventory and execute the tasks defined in the playbook.
+
+<br />
+
+logs/ : Every playbook writes its results (firmware inventory, GPU inventory, firmware update status, power state) to a JSON/CSV file in this folder - one file per host, per run, so you always have a record of what happened.
 
 
 
@@ -40,13 +44,15 @@ ansible-galaxy collection install community.general
 
 ```
 
-3. Run setup.yml to install ipmitool required for Power cycle
+3. Run the OS-specific setup playbook (in `setup/`) to install ipmitool required for Power cycle
 
 ```
 
-ansible-playbook -i inventory setup.yml
+ansible-playbook -i inventory setup/ubuntu_setup.yml
 
 ```
+
+(use `setup/RHEL_setup.yml` or `setup/SUSE_setup.yml` instead, depending on the control node's OS)
 
 
 
@@ -92,11 +98,11 @@ inputs:
 
 # Scripts
 
-1. system_firmware_update.yml : Playbook to perform firmware upgrade which requires target and the respective firmware files(hpm file) to be mentioned in the configuration file config.ini
+1. system_firmware_update.yml : Playbook to perform firmware upgrade - the list of firmware (.fwpkg) files to flash, and the order to flash them in, is set in the `[Firmware_XD690]` section of config.ini
 
 2. get_system_firmware_inventory.yml : Playbook to fetch the system firmware inventory information
 
-3. power_state_XD690.yml: Playbook to fetch the power state information, to power on, to power off the Compute XD690 nodes.
+3. power_control.yml: Playbook to check or change power state on the Compute XD690 nodes - power on, power off, reboot, or an IPMI AC power cycle, based on the `power_state` option in config.ini.
    
 4. get_gpu_inventory.yml : Playbook to fetch the gpu inventory information
 
@@ -117,6 +123,8 @@ For HPE Compute XD690 supported targets are:
   
 - E1 CPLD
 
+- GPU/HGX firmware bundle (flashed the same way as the targets above - see Firmware Upgrade section)
+
 
 # Firmware Upgrade
 
@@ -127,14 +135,22 @@ The playbook `system_firmware_update.yml` is used to perform the firmware upgrad
 
 2. Update the config.ini
 
-   - update_image_path_xd690 : Path to local hpm file for HPE Compute XD690
-
+   - Under `[Firmware_XD690]`, list the firmware files (.fwpkg) you want to flash, one per line, numbered in the order you want them flashed (1, 2, 3, ...). This works for BMC, BIOS, CPLD, and GPU/HGX firmware alike - just add the file path.
+   - For a single/individual firmware update, just list one entry (e.g. only `1 = <path>`).
 
 3. Run the ansible playbook:
 
    ```ansible-playbook -i inventory system_firmware_update.yml -e @system_credentials.yml -e @Compute-vault --ask-vault-pass```
 
-   After the firmware target is upgraded, the server reboots for all required components.
+   (`-e @Compute-vault --ask-vault-pass` is optional - only needed if you're using an ansible-vault encrypted credentials file)
+
+   Each firmware in the list is flashed one at a time, in order. If any of them fails, the run stops there and the remaining firmware in the list is not flashed.
+
+   Once every firmware in the list has been flashed successfully, the tool automatically reboots the system (and runs an IPMI AC power cycle too, if any CPLD firmware was included) so everything takes effect - this only happens once at the very end, not after each individual firmware.
+
+   To restore the BMC to its factory-default configuration after a successful firmware update, set `restore_bmc_to_default = yes` under `[BMC_Settings]` in `config.ini`. The default is `no`. This uses the Redfish `Manager.ResetToDefaults` action with `ResetType: ResetAll`; it can reset network settings and BMC users, so use it only when those defaults are intended.
+
+   Results for every step, including firmware version before/after, are saved to a JSON file under the `logs/` folder (one file per host, per run).
 
 
 
@@ -148,16 +164,39 @@ The playbook `get_system_firmware_inventory.yml` is used to fetch the firmware i
 
    `ansible-playbook -i inventory get_system_firmware_inventory.yml  -e @system_credentials.yml`
 
+   Results are saved to a JSON file under the `logs/` folder.
+
 
 # GPU Inventory
 
-The playbook `get_system_firmware_inventory.yml` is used to fetch the firmware inventory information of the Compute servers
+The playbook `get_gpu_inventory.yml` is used to fetch the GPU/HGX firmware inventory information of the Compute servers
 
 1. Update the following details in inputs.yml and inventory file accordingly
 
 2. Run the ansible playbook:
 
-   `ansible-playbook -i inventory get_gpu_inventory.yml  -e @system_credentials..yml
+   `ansible-playbook -i inventory get_gpu_inventory.yml  -e @system_credentials.yml`
+
+   Results are saved to a JSON file under the `logs/` folder.
+
+
+# Power Control
+
+The playbook `power_control.yml` is used to check or change the power state of a Compute server.
+
+1. Update the `power_state` option under `[Options]` in config.ini to one of:
+
+   - `NA` - just report the current power state, no action
+   - `on` - power the system on if it's currently off
+   - `off` - power the system off if it's currently on
+   - `reboot` - graceful reboot (same action the tool runs automatically after a BIOS/CPLD firmware update)
+   - `ac_cycle` - IPMI AC power cycle (same action the tool runs automatically after a CPLD firmware update)
+
+2. Run the ansible playbook:
+
+   `ansible-playbook -i inventory power_control.yml -e @system_credentials.yml`
+
+   Result is saved to a CSV file under the `logs/` folder.
 
 
 # Ansible-vault

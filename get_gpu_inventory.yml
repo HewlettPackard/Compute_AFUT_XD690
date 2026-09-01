@@ -10,9 +10,15 @@
     datatype: FirmwareInventory
 
   tasks:
+  - name: Ensure logs directory exists
+    file:
+      path: logs
+      state: directory
+    run_once: True
+
   - name: All GPU Inventory Details will be stored in the below json file
     set_fact:
-      output_file: "GPU_FW_Inventory_{{ ansible_date_time.date }}_{{ ansible_date_time.time }}.json"
+      output_file: "logs/GPU_FW_Inventory_{{ ansible_date_time.date }}_{{ ansible_date_time.time }}.json"
     run_once: True
 
   - name: Fetching GPU Inventory Details

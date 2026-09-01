@@ -8,11 +8,44 @@ __metaclass__ = type
 import json
 import subprocess
 import time
+import uuid
 from datetime import datetime
-from requests_toolbelt import MultipartEncoder
 # Use a minimal local Redfish client to avoid collection import issues
 from ansible.module_utils.urls import open_url
 from ansible.module_utils.six.moves.urllib.error import URLError, HTTPError
+
+
+def _encode_multipart_formdata(fields):
+    """
+    Self-contained multipart/form-data encoder used instead of
+    requests_toolbelt.MultipartEncoder, whose old apt-packaged builds
+    break on newer urllib3 (urllib3.contrib.appengine was removed in 2.x).
+    fields: ordered dict of name -> (filename_or_None, value_or_fileobj, content_type)
+    Returns: (body_bytes, content_type_header)
+    """
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, (filename, value, content_type) in fields.items():
+        parts.append(b'--' + boundary.encode('ascii'))
+        if filename:
+            disposition = 'Content-Disposition: form-data; name="%s"; filename="%s"' % (name, os.path.basename(str(filename)))
+        else:
+            disposition = 'Content-Disposition: form-data; name="%s"' % name
+        parts.append(disposition.encode('utf-8'))
+        if content_type:
+            parts.append(('Content-Type: %s' % content_type).encode('utf-8'))
+        parts.append(b'')
+        if hasattr(value, 'read'):
+            data = value.read()
+        elif isinstance(value, bytes):
+            data = value
+        else:
+            data = str(value).encode('utf-8')
+        parts.append(data)
+    parts.append(b'--' + boundary.encode('ascii') + b'--')
+    parts.append(b'')
+    body = b'\r\n'.join(parts)
+    return body, 'multipart/form-data; boundary=%s' % boundary
 class RedfishUtils(object):
     def __init__(self, creds, root_uri, timeout, module, data_modification=False):
         self.creds = creds or {}
@@ -73,7 +106,7 @@ from ansible.module_utils.urls import open_url, prepare_multipart
 from ansible.module_utils.six.moves.urllib.error import URLError, HTTPError
 import configparser
 
-supported_models=["XD670", "XD690", "NA"]
+supported_models=["XD690", "NA"]
 
 #to get inventory, update
 partial_models={}
@@ -81,8 +114,6 @@ partial_models={}
 supported_targets={
     "NA": ["BMC", "CPLDBACK_0", "CPLDDCSM_0", "CPLDE1SBP_0", "CPLDMB_0", "PCIeSwitch_0",  "PCIeSwitch_1"],
 }
-
-XD670_unsupported_targets = ["BMCImage1","BPB_CPLD1", "BPB_CPLD2", "MB_CPLD1", "SCM_CPLD1"] #only of Jakku
 
 # System firmware targets (non-GPU/HGX components) - based on actual Redfish inventory
 XD690_targets = ['BMC', 'CPLDBACK_0', 'CPLDDCSM_0', 'CPLDE1SBP_0', 'CPLDMB_0', 
@@ -323,6 +354,10 @@ class CrayRedfishUtils(RedfishUtils):
                 if model_val:
                     model = str(model_val).strip()
                     if model != "NA":
+                        # Remember which URI actually resolves on this BMC - some
+                        # platforms don't expose a 'Self' alias, so power actions
+                        # elsewhere shouldn't hardcode it.
+                        self._system_uri = system_uri
                         break
             except Exception:
                 continue
@@ -336,6 +371,14 @@ class CrayRedfishUtils(RedfishUtils):
                 if "XD" in dum:
                     partial_models[model.upper()]=dum.upper()
         return model
+
+    def _system_resource_uri(self):
+        """Return the /redfish/v1/Systems/<id> path that actually resolves on
+        this BMC, discovering it via get_model() if not already cached.
+        """
+        if not getattr(self, '_system_uri', None):
+            self.get_model()
+        return getattr(self, '_system_uri', None) or "/redfish/v1/Systems/Self"
 
     def get_firmware_inventory_collection(self):
         """Return FirmwareInventory as a dict of {Name: Version}.
@@ -380,7 +423,7 @@ class CrayRedfishUtils(RedfishUtils):
         return {'ret': True, 'inventory': inventory}
 
     def power_state(self):
-        response = self.get_request(self.root_uri + "/redfish/v1/Systems/Self")
+        response = self.get_request(self.root_uri + self._system_resource_uri())
         if response['ret'] is False:
             return "NA"
         state='None'
@@ -394,20 +437,22 @@ class CrayRedfishUtils(RedfishUtils):
 
     def power_on(self):
         payload = {"ResetType": "On"}
-        target_uri = "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset"
+        target_uri = self._system_resource_uri() + "/Actions/ComputerSystem.Reset"
         response1 = self.post_request(self.root_uri + target_uri, payload)
         time.sleep(120)
 
     def power_off(self):
         payload = {"ResetType": "ForceOff"}
-        target_uri = "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset"
+        target_uri = self._system_resource_uri() + "/Actions/ComputerSystem.Reset"
         response1 = self.post_request(self.root_uri + target_uri, payload)
         time.sleep(120)
 
-    def get_PS_CrayXD670(self,attr):
+    def get_PS_CrayXD690(self,attr):
         ini_path = os.path.join(os.getcwd(),'config.ini')
         config = configparser.ConfigParser()
         IP = attr.get('baseuri')
+        username = attr.get('username')
+        password = attr.get('password')
         config.read(ini_path)
         try:
             option = config.get('Options','power_state')
@@ -423,7 +468,7 @@ class CrayRedfishUtils(RedfishUtils):
             f.write(to_write)
             f.close()
         model = self.get_model()
-        if "XD670" in model.upper():
+        if "XD690" in model.upper():
             power_state = self.power_state()
             if option.upper()=="NA":
                 lis=[IP,model,power_state]
@@ -435,6 +480,23 @@ class CrayRedfishUtils(RedfishUtils):
             elif option.upper()=="OFF":
                 if power_state.upper()=="ON":
                     self.power_off()
+                power_state = self.power_state()
+                lis=[IP,model,power_state]
+            elif option.upper()=="REBOOT":
+                # Redfish graceful reboot - same action used after a BIOS/CPLD update
+                self.AC_PC_redfish()
+                power_state = self.power_state()
+                lis=[IP,model,power_state]
+            elif option.upper() in ("AC_CYCLE", "AC_CYCLE_IPMI"):
+                # IPMI AC power cycle (raw 0x3c 0x99) - same action used after a CPLD update
+                if not username or not password:
+                    return {'ret': False, 'changed': True, 'msg': 'username/password are required for AC_CYCLE'}
+                cycled, cycle_msg = self.ac_cycle_ipmi(IP, username, password)
+                if not cycled:
+                    return {'ret': False, 'changed': True, 'msg': 'ac_cycle failed: %s' % cycle_msg}
+                # An AC cycle isn't instant - give the system time to actually
+                # power down/up again before reporting a (likely stale) state.
+                time.sleep(180)
                 power_state = self.power_state()
                 lis=[IP,model,power_state]
             else:
@@ -514,9 +576,15 @@ class CrayRedfishUtils(RedfishUtils):
         response = self.post_request(self.root_uri + target_uri, payload)
         return response
 
+    def restore_bmc_to_defaults(self):
+        """Reset the BMC configuration using the standard Redfish action."""
+        payload = {"ResetType": "ResetAll"}
+        target_uri = "/redfish/v1/Managers/BMC/Actions/Manager.ResetToDefaults"
+        return self.post_request(self.root_uri + target_uri, payload)
+
     def AC_PC_redfish(self):
         payload = {"ResetType": "ForceRestart"}
-        target_uri = "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset"
+        target_uri = self._system_resource_uri() + "/Actions/ComputerSystem.Reset"
         response1 = self.post_request(self.root_uri + target_uri, payload)
         time.sleep(180)
         target_uri = "/redfish/v1/Chassis/Self/Actions/Chassis.Reset"
@@ -537,13 +605,18 @@ class CrayRedfishUtils(RedfishUtils):
     def ac_cycle_ipmi(self, IP, username, password):
         """Perform AC power cycle via IPMI raw command 0x3c 0x99.
         Used after CPLD firmware updates to activate the new firmware.
+        Returns: (success, message) - message carries ipmitool's own
+        output/error so callers aren't left guessing why it failed.
         """
+        command = 'ipmitool -I lanplus -H %s -U %s -P %s raw 0x3c 0x99' % (IP, username, password)
         try:
-            command = 'ipmitool -I lanplus -H %s -U %s -P %s raw 0x3c 0x99' % (IP, username, password)
-            subprocess.run(command, shell=True, check=True, timeout=30)
-            return True
-        except Exception:
-            return False
+            result = subprocess.run(command, shell=True, timeout=30, capture_output=True, text=True)
+            output = (result.stdout or '').strip() or (result.stderr or '').strip()
+            if result.returncode == 0:
+                return True, output or "AC cycle command accepted"
+            return False, "ipmitool exited %s: %s" % (result.returncode, output or "no output")
+        except Exception as e:
+            return False, str(e)
 
     def get_gpu_inventory(self, attr):
         """
@@ -609,43 +682,6 @@ class CrayRedfishUtils(RedfishUtils):
         
         return {'ret': True, 'changed': True, 'msg': json.dumps(result_data)}
 
-    def helper_update_GPU(self,update_status,target,image_path,image_type,IP,username,password,model):
-        update_status="Update failed"
-        ready = self.ensure_update_service_ready()
-        if ready.get('ret') is False:
-            return ready.get('msg', 'UpdateService not ready')
-        else:
-            data = (ready.get('data') or {})
-            if 'MultipartHttpPushUri' in data:
-                headers = {'Expect': 'Continue','Content-Type': 'multipart/form-data'}
-                body = {}
-                if target=="GPU_ALL" and "fwpkg" in image_path:
-                    response_memory = self.bmcfreememory()
-                    if not response_memory:
-                        update_status="BMC free memory failed"
-                    else:
-                        data_memory = response_memory['data']
-                        if 'Status' in data_memory and data_memory['Status'] == 'Success':
-                            targets_uri='/redfish/v1/UpdateService/FirmwareInventory/HGX_FW_BMC_0'
-                            body['UpdateParameters'] = (None, json.dumps({"Targets": [targets_uri]}), 'application/json')
-                            body['OemParameters'] = (None, json.dumps({"ImageType": image_type}) , 'application/json')
-                            with open(image_path, 'rb') as image_path_rb:
-                                body['UpdateFile'] = (image_path, image_path_rb,'application/octet-stream' )
-                                encoder = MultipartEncoder(body)
-                                body = encoder.to_string()
-                                headers['Content-Type'] = encoder.content_type
-                                tasks_before = self.list_task_uris()
-                                post_result = self.post_multi_request(self.root_uri + data['MultipartHttpPushUri'],
-                                                           headers=headers, payload=body)
-                                if not post_result.get('ret'):
-                                    update_status = "failed_Post: %s" % post_result.get('msg', 'unknown')
-                                else:
-                                    self._last_task_uri = self.resolve_latest_or_new_task_uri(post_result=post_result, tasks_before=tasks_before)
-                                    update_status = "success"
-                        else:
-                            update_status="Memory insufficient for firmware update"
-            return update_status
-
     def _detect_image_type(self, image_path):
         """
         Detect the firmware image type based on file extension.
@@ -667,7 +703,11 @@ class CrayRedfishUtils(RedfishUtils):
 
     def _is_task_completed(self, data):
         """Check if task data indicates completion (success or failure).
-        Returns: (is_done, is_success) tuple
+        Returns: (is_done, is_success) tuple. is_done is True for a confirmed
+        terminal state, or the string 'provisional' for a 100%/OK signal that
+        isn't backed by an explicit terminal TaskState yet - some BMCs report
+        this transiently before later flipping to Exception during final
+        validation, so callers should re-confirm before trusting it.
         """
         task_state = data.get('TaskState', '')
         task_status = data.get('TaskStatus', '')
@@ -680,10 +720,6 @@ class CrayRedfishUtils(RedfishUtils):
         if task_state in ('Exception', 'Killed', 'Cancelled'):
             return (True, False)
 
-        # 100% with OK status
-        if percent == 100 and task_status == 'OK':
-            return (True, True)
-
         # Check messages for completion indicators
         for msg in (messages or []):
             if not isinstance(msg, dict):
@@ -693,6 +729,10 @@ class CrayRedfishUtils(RedfishUtils):
                 return (True, True)
             if 'FirmwareUpdateCompleted' in msg_id:
                 return (True, True)
+
+        # 100% with OK status, but no explicit terminal TaskState - provisional only
+        if percent == 100 and task_status == 'OK':
+            return ('provisional', True)
 
         return (False, False)
 
@@ -747,8 +787,23 @@ class CrayRedfishUtils(RedfishUtils):
                 last_state = task_state
 
             is_done, is_success = self._is_task_completed(data)
-            if is_done:
+            if is_done is True:
                 return _build_result(data, is_success)
+            if is_done == 'provisional':
+                # Don't trust a bare 100%/OK signal immediately - give the BMC
+                # a moment to flip to Exception during final validation if
+                # it's going to, then re-check before declaring success.
+                time.sleep(20)
+                confirm_resp = self.get_request(self.root_uri + task_uri, timeout=POLL_HTTP_TIMEOUT)
+                if confirm_resp.get('ret'):
+                    confirm_data = confirm_resp.get('data') or {}
+                    confirm_done, confirm_success = self._is_task_completed(confirm_data)
+                    if confirm_done is True:
+                        return _build_result(confirm_data, confirm_success)
+                    if confirm_done == 'provisional':
+                        # Still just 100%/OK after the grace period - accept it.
+                        return _build_result(confirm_data, True)
+                # Confirmation request failed - keep polling normally.
 
             time.sleep(poll_interval)
 
@@ -762,40 +817,74 @@ class CrayRedfishUtils(RedfishUtils):
 
         return {'ret': False, 'msg': 'Task polling timed out', 'state': last_state, 'percent': last_percent, 'progress_log': progress_log}
 
-    def fetch_update_target_XD690(self):
+    def fetch_update_target_XD690(self, timeout_seconds=300, poll_interval=15):
             """
             Fetch the appropriate update target for XD690 systems.
+            Polls the task until the 'Update.1.0.TargetDetermined' message
+            appears or the task reaches a terminal state - a single
+            fixed-delay check missed this message on slower transfers.
             Returns: update_target string or None
             """
-            time.sleep(60)
-            try:
-                if not self._last_task_uri:
-                    return None
-                
-                target_uri = self._last_task_uri 
-                resp = self.get_request(self.root_uri + target_uri)
-                if resp.get('ret') is False:
-                    return None
-    
-                data = resp.get('data') or {}
-                messages = data.get('Messages') or []
-                
-                for msg in messages:
-                    if not isinstance(msg, dict):
-                        continue
-                        
-                    msg_id = msg.get('MessageId', '')
-                    if msg_id == "Update.1.0.TargetDetermined":
-                        msg_args = msg.get('MessageArgs', [])
-                        if msg_args and len(msg_args) > 0:
-                            update_target = msg_args[0]
-                            return update_target
-                
+            if not self._last_task_uri:
                 return None
-                    
-            except Exception as e:
-                return None
+
+            target_uri = self._last_task_uri
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                try:
+                    resp = self.get_request(self.root_uri + target_uri)
+                    if resp.get('ret') is False:
+                        return None
+
+                    data = resp.get('data') or {}
+                    messages = data.get('Messages') or []
+
+                    for msg in messages:
+                        if not isinstance(msg, dict):
+                            continue
+
+                        msg_id = msg.get('MessageId', '')
+                        if msg_id == "Update.1.0.TargetDetermined":
+                            msg_args = msg.get('MessageArgs', [])
+                            if msg_args and len(msg_args) > 0:
+                                return msg_args[0]
+
+                    if data.get('TaskState') in ('Completed', 'Exception', 'Killed', 'Cancelled'):
+                        return None
+                except Exception:
+                    return None
+
+                time.sleep(poll_interval)
+
+            return None
             
+    def _resolve_canonical_target(self, raw_target, inventory):
+        """Resolve the BMC task's free-text target name (e.g. 'HostBMC_0')
+        to the actual FirmwareInventory member name (e.g. 'BMC') by matching
+        against the live inventory collection fetched from the BMC itself.
+        Avoids hardcoding any naming/folder convention that could change.
+        """
+        if not raw_target or not isinstance(inventory, dict):
+            return raw_target
+
+        # Exact match against a real inventory member name
+        if raw_target in inventory:
+            return raw_target
+
+        raw_upper = raw_target.upper()
+        for name in inventory.keys():
+            name_upper = name.upper()
+            if name_upper == raw_upper:
+                return name
+            # e.g. raw_target 'HostBMC_0' contains inventory name 'BMC',
+            # or inventory name contains the raw target string
+            if name_upper in raw_upper or raw_upper in name_upper:
+                return name
+
+        # No confident match found in the live inventory - fall back to
+        # whatever the BMC's task message reported.
+        return raw_target
+
     def helper_update(self, update_status, image_path, image_type, IP, username, password, model):
         """
         Generic helper function to update firmware.
@@ -828,11 +917,18 @@ class CrayRedfishUtils(RedfishUtils):
         update_params = {"Targets": [], "ForceUpdate": True}
         body['UpdateParameters'] = (None, json.dumps(update_params), 'application/json')
 
+        # Snapshot firmware inventory before the upload starts. Querying a
+        # target's version mid-task (after upload begins) is unreliable since
+        # its FirmwareInventory record is often unavailable while transferring.
+        # get_firmware_inventory_collection() returns {'ret':.., 'inventory': {name: version}} -
+        # unwrap it here so lookups below are against the actual name->version map.
+        pre_inventory_resp = self.get_firmware_inventory_collection()
+        pre_inventory = pre_inventory_resp.get('inventory') or {} if pre_inventory_resp.get('ret') else {}
+
         with open(image_path, 'rb') as image_path_rb:
             body['UpdateFile'] = (os.path.basename(image_path), image_path_rb, 'application/octet-stream')
-            encoder = MultipartEncoder(body)
-            encoded_body = encoder.to_string()
-            headers['Content-Type'] = encoder.content_type
+            encoded_body, content_type = _encode_multipart_formdata(body)
+            headers['Content-Type'] = content_type
             tasks_before = self.list_task_uris()
             post_result = self.post_multi_request(self.root_uri + upload_uri,
                                         headers=headers, payload=encoded_body)
@@ -843,11 +939,18 @@ class CrayRedfishUtils(RedfishUtils):
                 self._last_task_uri = self.resolve_latest_or_new_task_uri(post_result=post_result, tasks_before=tasks_before)
                 
                 # Poll task for completion with live progress
+                # Resolve the BMC's free-text target name against the live
+                # FirmwareInventory collection fetched before the update.
+                raw_target = self.fetch_update_target_XD690()
+                self.target = self._resolve_canonical_target(raw_target, pre_inventory)
+                if self.target:
+                    before_version = pre_inventory.get(self.target, "NA")
                 if self._last_task_uri:
-                    self.target = self.fetch_update_target_XD690()
-                    if self.target:
-                        before_version = self.get_fw_version(self.target)
-                    task_result = self._poll_task_completion(self._last_task_uri, timeout_seconds=1800)
+                    # 60 min - some firmware images (e.g. CPLD) can genuinely
+                    # still be "Running" past 30 min; a real timeout previously
+                    # killed an in-progress-but-healthy task and stopped the
+                    # whole ordered sequence.
+                    task_result = self._poll_task_completion(self._last_task_uri, timeout_seconds=3600)
                     if task_result.get('ret'):
                         update_status = "success"
                     else:
@@ -865,8 +968,14 @@ class CrayRedfishUtils(RedfishUtils):
                     # No task URI - assume success if POST returned OK
                     update_status = "success"
 
-                # Post-update actions per target type
-                if self.target.upper() == 'BMC':
+                # Post-update actions per target type - only when the task
+                # itself actually succeeded; on failure just report "NA" so a
+                # failed step never gets a misleading "pending_final_*" marker
+                # that never gets backfilled (the sequence stops on failure).
+                target_name = (self.target or "").upper()
+                if update_status != "success":
+                    after_version = "NA"
+                elif target_name == 'BMC':
                     # BMC reboots after update - wait 5 minutes for it to come back
                     time.sleep(300)
                     after_version = "NA"
@@ -876,40 +985,55 @@ class CrayRedfishUtils(RedfishUtils):
                             after_version = ver
                             break
                         time.sleep(30)
-                elif self.target.upper() in ('BIOS', 'BIOS2'):
+                elif target_name in ('BIOS', 'BIOS2'):
                     # BIOS PLDM update: after task reaches 100%, BMC automatically
-                    # performs DC cycle -> AC cycle -> flash recovery -> 2nd DC -> 2nd AC
-                    # This takes ~30 minutes. Wait then retry getting version.
-                    time.sleep(1800)  # 30 min for auto power cycles to complete
-                    after_version = "NA"
-                    for retry in range(10):
-                        ver = self.get_fw_version(self.target)
-                        if not ver.startswith("NA"):
-                            after_version = ver
-                            break
-                        time.sleep(30)
-                elif self.target.upper() in CPLD_TARGETS:
-                    # CPLD updates require an IPMI AC power cycle to activate
-                    # Wait before AC cycle to let BMC settle after update
-                    time.sleep(120)
-                    
-                    # Perform AC cycle via IPMI raw command 0x3c 0x99
-                    self.ac_cycle_ipmi(IP, username, password)
-                    
-                    # Wait for system to recover after AC cycle
-                    time.sleep(180)
-                    
-                    # Retry getting firmware version after AC cycle
+                    # performs DC cycle -> AC cycle -> flash recovery -> 2nd DC -> 2nd AC.
+                    # Defer that wait + version check to the end of the whole ordered
+                    # sequence instead of doing it per-step, so multiple firmware in
+                    # one run only go through this settle-and-reboot once.
+                    self._pending_reboot = True
+                    after_version = "pending_final_reboot"
+                elif target_name in CPLD_TARGETS:
+                    # CPLD updates require an IPMI AC power cycle to activate.
+                    # Defer the cycle + version check to the end of the whole
+                    # ordered sequence instead of doing it per-step, so multiple
+                    # CPLD entries in one run only get AC-cycled once.
+                    self._pending_ac_cycle = True
+                    after_version = "pending_final_ac_cycle"
+                elif target_name.startswith('HGX'):
+                    # GPU/HGX firmware (a single member like HGX_FW_BMC_0, or an
+                    # unresolved bundle id like HGX_0) - like CPLD, these require
+                    # an AC power cycle before FirmwareInventory reflects the new
+                    # version. This was previously never scheduled here (only
+                    # BMC/BIOS/CPLD triggered a reboot/cycle), so GPU/HGX updates
+                    # silently never got power-cycled. Defer one cycle for the
+                    # whole ordered sequence, same as CPLD, instead of polling for
+                    # up to 30 min per step waiting for a cycle that hasn't
+                    # happened yet.
+                    # Track only the resolved component itself (e.g. HGX_FW_BMC_0),
+                    # not every HGX_* entry in inventory.
+                    if self.target:
+                        before_version = {self.target: pre_inventory.get(self.target, "NA")}
+                    self._pending_ac_cycle = True
+                    after_version = "pending_final_ac_cycle"
+                else:
+                    # Any remaining target - a single component (PSU, PCIeSwitch,
+                    # etc.) or an otherwise-unmapped bundle. Diff the whole
+                    # inventory before vs after so one path correctly reports
+                    # either a single changed component or several, with no
+                    # divergent behavior between the two cases.
+                    before_version = {}
                     after_version = "NA"
                     for retry in range(6):
-                        ver = self.get_fw_version(self.target)
-                        if not ver.startswith("NA"):
-                            after_version = ver
+                        post_resp = self.get_firmware_inventory_collection()
+                        post_inventory = post_resp.get('inventory') or {} if post_resp.get('ret') else {}
+                        changed = {name: ver for name, ver in post_inventory.items()
+                                   if pre_inventory.get(name, "NA") != ver}
+                        if changed:
+                            before_version = {name: pre_inventory.get(name, "NA") for name in changed}
+                            after_version = changed
                             break
                         time.sleep(30)
-                else:
-                    # Other targets - get version immediately
-                    after_version = self.get_fw_version(self.target)
 
         
         return before_version, after_version, update_status
@@ -961,96 +1085,189 @@ class CrayRedfishUtils(RedfishUtils):
         
         return True
 
+    def get_firmware_order(self, config, model):
+        """
+        Build the ordered list of firmware image paths to flash in sequence.
+
+        Looks for a model-specific section [Firmware_XD690] first
+        (keys are the flash order, e.g. 1, 2, 3, ...), falling back to the
+        generic [Firmware_Order] section. For a single/individual firmware
+        update, just list one entry in the section (e.g. only "1 = <path>").
+        """
+        short_model = partial_models.get(model.upper()) if model != "NA" else None
+        section_candidates = []
+        if short_model:
+            section_candidates.append('Firmware_%s' % short_model)
+        section_candidates.append('Firmware_Order')
+
+        for section in section_candidates:
+            if config.has_section(section):
+                items = config.items(section)
+                try:
+                    ordered_items = sorted(items, key=lambda kv: int(kv[0]))
+                except ValueError:
+                    ordered_items = items
+                paths = [value.strip() for _, value in ordered_items if value and value.strip()]
+                if paths:
+                    return paths
+
+        return []
+
     def system_fw_update(self, attr):
         """
-        Main function to update BMC firmware only.
-        Reads configuration from config.ini and performs BMC firmware update.
-        Results are logged to a JSON file for easy parsing and viewing.
+        Main function to update one or more firmware images on a single target.
+        Reads the ordered firmware list from config.ini and flashes each image
+        one at a time, in the configured order, stopping the sequence on the
+        first failure. Results for every step are logged to a JSON file.
         """
         ini_path = os.path.join(os.getcwd(), 'config.ini')
         config = configparser.ConfigParser()
         config.read(ini_path)
         self.target = ""
-        # Image paths are optional; support both XD670 and XD690 keys.
-        image_path_inputs = {}
-        try:
-            image_path_inputs["XD670"] = config.get('Image', 'update_image_path_xd690')
-        except Exception:
-            image_path_inputs["XD670"] = ""
-        try:
-            image_path_inputs["XD690"] = config.get('Image', 'update_image_path_xd690')
-        except Exception:
-            image_path_inputs["XD690"] = ""
-
-        # Check that at least one image path is set
-        if not any(v for v in image_path_inputs.values() if v):
-            return {'ret': False, 'changed': True, 'msg': 'Must specify update_image_path_xd690 or update_image_path_xd690 in config.ini'}
 
         IP = attr.get('baseuri')
         username = attr.get('username')
         password = attr.get('password')
         output_file_name = attr.get('output_file_name')
-        
+        restore_bmc_to_default = config.getboolean(
+            'BMC_Settings', 'restore_bmc_to_default', fallback=False)
+
         # Convert to JSON if CSV extension provided
         if output_file_name.endswith('.csv'):
             output_file_name = output_file_name.replace('.csv', '.json')
         elif not output_file_name.endswith('.json'):
             output_file_name += '.json'
-        
+
         # Image type will be auto-detected from file extension
         image_type = None
 
         # Get system model
         model = self.get_model()
 
-        # Prepare result data structure
-        result_data = {
+        firmware_list = self.get_firmware_order(config, model)
+        if not firmware_list:
+            return {'ret': False, 'changed': True,
+                     'msg': 'Must specify at least one entry in the '
+                            '[Firmware_XD690] (or [Firmware_Order]) section in config.ini'}
+
+        total_steps = len(firmware_list)
+        step_results = []
+        all_succeeded = True
+        self._pending_reboot = False
+        self._pending_ac_cycle = False
+
+        for step, image_path in enumerate(firmware_list, start=1):
+            result_data = {
+                "ip_address": IP,
+                "model": model,
+                "step": step,
+                "total_steps": total_steps,
+                "firmware_image": os.path.basename(image_path),
+                "target": "",
+                "fw_version_before": "NA",
+                "fw_version_after": "NA",
+                "status": "unknown",
+                "message": "",
+                "task_uri": ""
+            }
+
+            if not os.path.isfile(image_path):
+                result_data["status"] = "firmware_file_not_found"
+                result_data["message"] = f"[{step}/{total_steps}] Firmware file not found at: {image_path}"
+                self._append_to_json_log(output_file_name, result_data)
+                step_results.append(result_data)
+                all_succeeded = False
+                break
+
+            # Perform firmware update for this step
+            bef_ver, aft_ver, update_status = self.helper_update(None, image_path, image_type, IP, username, password, model)
+            result_data["target"] = self.target
+            result_data["fw_version_before"] = bef_ver
+            result_data["fw_version_after"] = aft_ver
+            result_data["status"] = update_status
+            result_data["task_uri"] = getattr(self, '_last_task_uri', '') or ""
+
+            if update_status and update_status.lower() == "success":
+                result_data["message"] = f"[{step}/{total_steps}] {self.target} firmware successfully updated from {bef_ver} to {aft_ver}"
+            else:
+                result_data["message"] = f"[{step}/{total_steps}] {self.target} firmware update failed with status: {update_status}"
+
+            self._append_to_json_log(output_file_name, result_data)
+            step_results.append(result_data)
+
+            if not update_status or update_status.lower() != "success":
+                # Stop the ordered sequence on first failure; later firmware
+                # in the list may depend on this one having succeeded.
+                all_succeeded = False
+                break
+
+        # Perform the deferred BIOS reboot / CPLD AC-cycle once, at the end of
+        # the whole ordered sequence, instead of once per BIOS/CPLD step.
+        if all_succeeded and total_steps > 0:
+            if self._pending_reboot:
+                time.sleep(1800)  # 30 min for BMC's automatic power cycles to complete
+            if self._pending_ac_cycle:
+                time.sleep(120)  # let BMC settle after the last CPLD update
+                self.ac_cycle_ipmi(IP, username, password)
+                time.sleep(180)  # let the system recover after the AC cycle
+
+            # Backfill fw_version_after for every step that deferred its check
+            for result_data in step_results:
+                if result_data.get("fw_version_after") not in ("pending_final_reboot", "pending_final_ac_cycle"):
+                    continue
+                before = result_data.get("fw_version_before")
+                if isinstance(before, dict):
+                    # Multi-component HGX/GPU target - one inventory fetch per
+                    # retry covers every tracked component instead of a
+                    # separate request per name.
+                    final_version = {name: "NA" for name in before}
+                    for retry in range(10):
+                        post_resp = self.get_firmware_inventory_collection()
+                        post_inventory = post_resp.get('inventory') or {} if post_resp.get('ret') else {}
+                        for name in before:
+                            final_version[name] = post_inventory.get(name, final_version[name])
+                        if all(not str(v).startswith("NA") for v in final_version.values()):
+                            break
+                        time.sleep(30)
+                else:
+                    target = result_data.get("target")
+                    final_version = "NA"
+                    for retry in range(10):
+                        ver = self.get_fw_version(target)
+                        if not ver.startswith("NA"):
+                            final_version = ver
+                            break
+                        time.sleep(30)
+                result_data["fw_version_after"] = final_version
+                result_data["message"] = (
+                    f"[{result_data['step']}/{total_steps}] {result_data.get('target')} firmware successfully updated "
+                    f"from {before} to {final_version}"
+                )
+                self._append_to_json_log(output_file_name, result_data)
+
+        # Final host reboot once the whole ordered sequence has completed
+        # successfully, so all flashed firmware takes effect.
+        if all_succeeded and total_steps > 0:
+            self.AC_PC_redfish()
+
+        restore_result = None
+        if all_succeeded and total_steps > 0 and restore_bmc_to_default:
+            restore_result = self.restore_bmc_to_defaults()
+            if not restore_result.get('ret'):
+                all_succeeded = False
+
+        summary = {
             "ip_address": IP,
             "model": model,
-            "target": self.target,
-            "fw_version_before": "NA",
-            "fw_version_after": "NA",
-            "status": "unknown",
-            "message": "",
-            "task_uri": ""
+            "total_steps": total_steps,
+            "completed_steps": len(step_results),
+            "overall_status": "success" if all_succeeded else "failed",
+            "restore_bmc_to_default": restore_bmc_to_default,
+            "restore_bmc_to_default_status": (
+                "success" if restore_result and restore_result.get('ret')
+                else "failed" if restore_result else "skipped"
+            ),
+            "steps": step_results,
         }
 
-        # Get image path for the model if known; otherwise use the first configured path.
-        image_path = ""
-        try:
-            short_model = partial_models.get(model.upper()) if model != "NA" else None
-            if short_model and short_model in image_path_inputs and image_path_inputs.get(short_model):
-                image_path = image_path_inputs[short_model]
-        except Exception:
-            image_path = ""
-        if not image_path:
-            for candidate in (image_path_inputs.get("XD690"), image_path_inputs.get("XD670")):
-                if candidate:
-                    image_path = candidate
-                    break
-
-        # Check if image file exists
-        if not os.path.isfile(image_path):
-            result_data["status"] = "firmware_file_not_found"
-            result_data["message"] = f"Firmware file not found at: {image_path}"
-            self._append_to_json_log(output_file_name, result_data)
-            return {'ret': False, 'changed': True, 'msg': json.dumps(result_data)}
-
-        # Perform firmware update
-        bef_ver, aft_ver, update_status = self.helper_update(None, image_path, image_type, IP, username, password, model)
-        result_data["target"] = self.target
-        result_data["fw_version_before"] = bef_ver
-        result_data["fw_version_after"] = aft_ver
-        result_data["status"] = update_status
-        result_data["firmware_image"] = os.path.basename(image_path)
-        result_data["task_uri"] = getattr(self, '_last_task_uri', '') or ""
-        
-        if update_status.lower() == "success":
-            result_data["message"] = f"{self.target} firmware successfully updated from {bef_ver} to {aft_ver}"
-        else:
-            result_data["message"] = f"{self.target} firmware update failed with status: {update_status}"
-        
-        # Log result to JSON file
-        self._append_to_json_log(output_file_name, result_data)
-        
-        return {'ret': True, 'changed': True, 'msg': json.dumps(result_data)}
+        return {'ret': all_succeeded, 'changed': True, 'msg': json.dumps(summary)}
