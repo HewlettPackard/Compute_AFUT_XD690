@@ -1,7 +1,7 @@
 ---
 - hosts: xds
   connection: local
-  name: version 1.0 Power control for HPE Cray XD690 systems (on/off/reboot/ac_cycle)
+  name: version 2.0 Power control for HPE Cray XD690 systems (on/off/reboot/ac_cycle)
   gather_facts: yes
   vars:
     bmc_username: "{{ inputs[inventory_hostname].user }}"
