@@ -362,6 +362,28 @@ class CrayRedfishUtils(RedfishUtils):
             except Exception:
                 continue
 
+        # None of the guessed aliases resolved (e.g. AMI/MegaRAC BMCs on some
+        # XD690 units expose the system under a numeric id instead) - fall
+        # back to enumerating the Systems collection.
+        if model == "NA":
+            try:
+                coll = self.get_request(self.root_uri + "/redfish/v1/Systems")
+                members = ((coll.get('data') or {}).get('Members') or []) if coll.get('ret') else []
+                for member in members:
+                    system_uri = self._normalize_redfish_uri((member or {}).get('@odata.id'))
+                    if not system_uri:
+                        continue
+                    response = self.get_request(self.root_uri + system_uri)
+                    if not response.get('ret'):
+                        continue
+                    model_val = (response.get('data') or {}).get('Model')
+                    if model_val:
+                        model = str(model_val).strip()
+                        self._system_uri = system_uri
+                        break
+            except Exception:
+                pass
+
         if model == "NA":
             return "NA"
 
@@ -594,8 +616,11 @@ class CrayRedfishUtils(RedfishUtils):
 
     def AC_PC_ipmi(self, IP, username, password, routing_value):
         try:
-            command='ipmitool -I lanplus -H '+IP+' -U '+username+' -P '+password+' raw '+ routing_value
-            subprocess.run(command, shell=True, check=True, timeout=15)
+            # Pass args as a list (no shell=True) so special characters in
+            # the password (e.g. '.', '+', spaces) aren't parsed by a shell.
+            command = ['ipmitool', '-I', 'lanplus', '-H', IP, '-U', username,
+                       '-P', password, 'raw'] + routing_value.split()
+            subprocess.run(command, check=True, timeout=15)
             time.sleep(300)
             self.power_on()
             return True
@@ -608,9 +633,12 @@ class CrayRedfishUtils(RedfishUtils):
         Returns: (success, message) - message carries ipmitool's own
         output/error so callers aren't left guessing why it failed.
         """
-        command = 'ipmitool -I lanplus -H %s -U %s -P %s raw 0x3c 0x99' % (IP, username, password)
+        # Pass args as a list (no shell=True) so special characters in the
+        # password aren't parsed/mangled by a shell.
+        command = ['ipmitool', '-I', 'lanplus', '-H', IP, '-U', username,
+                   '-P', password, 'raw', '0x3c', '0x99']
         try:
-            result = subprocess.run(command, shell=True, timeout=30, capture_output=True, text=True)
+            result = subprocess.run(command, timeout=30, capture_output=True, text=True)
             output = (result.stdout or '').strip() or (result.stderr or '').strip()
             if result.returncode == 0:
                 return True, output or "AC cycle command accepted"
@@ -976,14 +1004,19 @@ class CrayRedfishUtils(RedfishUtils):
                 if update_status != "success":
                     after_version = "NA"
                 elif target_name == 'BMC':
-                    # BMC reboots after update - wait 5 minutes for it to come back
+                    # BMC reboots after update - wait 5 minutes for it to come back.
+                    # Keep polling until the reported version actually differs from
+                    # before_version - the BMC can briefly keep reporting its old
+                    # cached version right after coming back, before its own
+                    # FirmwareInventory record catches up (see IRP-33191).
                     time.sleep(300)
                     after_version = "NA"
-                    for retry in range(6):
+                    for retry in range(10):
                         ver = self.get_fw_version(self.target)
                         if not ver.startswith("NA"):
                             after_version = ver
-                            break
+                            if ver != before_version:
+                                break
                         time.sleep(30)
                 elif target_name in ('BIOS', 'BIOS2'):
                     # BIOS PLDM update: after task reaches 100%, BMC automatically
@@ -1098,6 +1131,13 @@ class CrayRedfishUtils(RedfishUtils):
         section_candidates = []
         if short_model:
             section_candidates.append('Firmware_%s' % short_model)
+        # This tool only ships support for XD690, so always accept its section
+        # even if live model detection above didn't resolve (e.g. BMC doesn't
+        # expose a Model field at a URI this code checks).
+        for supported in supported_models:
+            section = 'Firmware_%s' % supported
+            if section not in section_candidates:
+                section_candidates.append(section)
         section_candidates.append('Firmware_Order')
 
         for section in section_candidates:
@@ -1131,6 +1171,13 @@ class CrayRedfishUtils(RedfishUtils):
         output_file_name = attr.get('output_file_name')
         restore_bmc_to_default = config.getboolean(
             'BMC_Settings', 'restore_bmc_to_default', fallback=False)
+        # An explicit power_state (anything other than NA) overrides the
+        # automatic BIOS-reboot / CPLD-ac_cycle behavior at the end of the
+        # sequence - see the override block after the update loop below.
+        try:
+            power_state_override = config.get('Options', 'power_state').strip()
+        except Exception:
+            power_state_override = 'NA'
 
         # Convert to JSON if CSV extension provided
         if output_file_name.endswith('.csv'):
@@ -1201,54 +1248,89 @@ class CrayRedfishUtils(RedfishUtils):
                 all_succeeded = False
                 break
 
-        # Perform the deferred BIOS reboot / CPLD AC-cycle once, at the end of
-        # the whole ordered sequence, instead of once per BIOS/CPLD step.
+        # Perform the deferred BIOS/CPLD settle wait once, at the end of the
+        # whole ordered sequence, instead of once per BIOS/CPLD step. The
+        # actual reboot/ac_cycle action itself is decided further below by
+        # the power_state override (or the automatic default if it's NA).
         if all_succeeded and total_steps > 0:
             if self._pending_reboot:
                 time.sleep(1800)  # 30 min for BMC's automatic power cycles to complete
             if self._pending_ac_cycle:
                 time.sleep(120)  # let BMC settle after the last CPLD update
-                self.ac_cycle_ipmi(IP, username, password)
-                time.sleep(180)  # let the system recover after the AC cycle
 
             # Backfill fw_version_after for every step that deferred its check
             for result_data in step_results:
                 if result_data.get("fw_version_after") not in ("pending_final_reboot", "pending_final_ac_cycle"):
                     continue
                 before = result_data.get("fw_version_before")
+                confirmed_changed = False
                 if isinstance(before, dict):
                     # Multi-component HGX/GPU target - one inventory fetch per
                     # retry covers every tracked component instead of a
-                    # separate request per name.
+                    # separate request per name. Keep polling until every
+                    # value both resolves AND differs from its pre-update
+                    # reading - a resolvable-but-unchanged value can mean the
+                    # BMC just hasn't refreshed its own inventory yet (IRP-33191).
                     final_version = {name: "NA" for name in before}
-                    for retry in range(10):
+                    for retry in range(20):
                         post_resp = self.get_firmware_inventory_collection()
                         post_inventory = post_resp.get('inventory') or {} if post_resp.get('ret') else {}
                         for name in before:
                             final_version[name] = post_inventory.get(name, final_version[name])
-                        if all(not str(v).startswith("NA") for v in final_version.values()):
+                        confirmed_changed = all(
+                            not str(v).startswith("NA") and v != before.get(name)
+                            for name, v in final_version.items()
+                        )
+                        if confirmed_changed:
                             break
                         time.sleep(30)
                 else:
                     target = result_data.get("target")
                     final_version = "NA"
-                    for retry in range(10):
+                    for retry in range(20):
                         ver = self.get_fw_version(target)
                         if not ver.startswith("NA"):
                             final_version = ver
-                            break
+                            if ver != before:
+                                confirmed_changed = True
+                                break
                         time.sleep(30)
                 result_data["fw_version_after"] = final_version
                 result_data["message"] = (
                     f"[{result_data['step']}/{total_steps}] {result_data.get('target')} firmware successfully updated "
                     f"from {before} to {final_version}"
                 )
+                if not confirmed_changed:
+                    # Never saw the version actually change within the retry
+                    # budget - could be a genuine same-version reflash, or the
+                    # BMC still hasn't refreshed its inventory. Flag it so this
+                    # isn't silently indistinguishable from a real update (IRP-33191).
+                    result_data["message"] += " (version unchanged after retries - may already be at this version, or BMC inventory has not refreshed yet)"
                 self._append_to_json_log(output_file_name, result_data)
 
-        # Final host reboot once the whole ordered sequence has completed
-        # successfully, so all flashed firmware takes effect.
+        # Final power action once the whole ordered sequence has completed
+        # successfully. An explicit power_state option (anything other than
+        # NA) overrides the automatic behavior and is applied exactly once,
+        # whether this was a single-firmware or multi-firmware run.
         if all_succeeded and total_steps > 0:
-            self.AC_PC_redfish()
+            override = (power_state_override or 'NA').upper()
+            if override == 'ON':
+                if self.power_state().upper() == 'OFF':
+                    self.power_on()
+            elif override == 'OFF':
+                if self.power_state().upper() == 'ON':
+                    self.power_off()
+            elif override == 'REBOOT':
+                self.AC_PC_redfish()
+            elif override in ('AC_CYCLE', 'AC_CYCLE_IPMI'):
+                self.ac_cycle_ipmi(IP, username, password)
+            else:
+                # NA / unset - automatic default: AC-cycle once if any CPLD
+                # was flashed, then always reboot so everything takes effect.
+                if self._pending_ac_cycle:
+                    self.ac_cycle_ipmi(IP, username, password)
+                    time.sleep(180)  # let the system recover after the AC cycle
+                self.AC_PC_redfish()
 
         restore_result = None
         if all_succeeded and total_steps > 0 and restore_bmc_to_default:
