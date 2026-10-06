@@ -605,14 +605,54 @@ class CrayRedfishUtils(RedfishUtils):
         return self.post_request(self.root_uri + target_uri, payload)
 
     def AC_PC_redfish(self):
-        payload = {"ResetType": "ForceRestart"}
+        # Reboot via the standard ComputerSystem.Reset action only - no Chassis.Reset.
+        payload = {"ResetType": "PowerCycle"}
         target_uri = self._system_resource_uri() + "/Actions/ComputerSystem.Reset"
         response1 = self.post_request(self.root_uri + target_uri, payload)
         time.sleep(180)
-        target_uri = "/redfish/v1/Chassis/Self/Actions/Chassis.Reset"
-        response2 = self.post_request(self.root_uri + target_uri, payload)
-        time.sleep(180)
-        return response1 or response2
+        return response1
+
+    def _reboot_and_wait_for_version(self, target, before_version, settle_seconds=120,
+                                      timeout_seconds=1800, poll_interval=30,
+                                      min_elapsed_before_trust=300, stable_reads_required=3):
+        """Settle after a flash completes, reboot via Redfish PowerCycle, then
+        poll until `target`'s firmware version is confirmed - either because
+        it now differs from before_version (a real version bump, returned
+        immediately), or because it reads back the same value on
+        `stable_reads_required` consecutive polls after `min_elapsed_before_trust`
+        seconds have passed (a legitimate same-version reflash, e.g. ForceUpdate
+        on an image that's already installed). The elapsed-time floor avoids
+        mistaking an early stale/cached read - taken before the BMC has actually
+        refreshed its FirmwareInventory - for a settled same-version result.
+        Falls back to timeout_seconds as an absolute safety net either way.
+        Returns: (version, confirmed) - confirmed is False only if the timeout
+        is reached without either signal settling.
+        """
+        time.sleep(settle_seconds)
+        self.AC_PC_redfish()
+        reboot_issued_at = time.time()
+        deadline = reboot_issued_at + timeout_seconds
+        after_version = "NA"
+        same_reads_in_a_row = 0
+
+        while time.time() < deadline:
+            ver = self.get_fw_version(target)
+            if not ver.startswith("NA"):
+                after_version = ver
+                if ver != before_version:
+                    return after_version, True
+                if time.time() - reboot_issued_at >= min_elapsed_before_trust:
+                    same_reads_in_a_row += 1
+                    if same_reads_in_a_row >= stable_reads_required:
+                        return after_version, True
+                else:
+                    same_reads_in_a_row = 0
+            else:
+                # Unreachable/still rebooting - any stability streak so far doesn't count
+                same_reads_in_a_row = 0
+            time.sleep(poll_interval)
+
+        return after_version, False
 
     def AC_PC_ipmi(self, IP, username, password, routing_value):
         try:
@@ -845,12 +885,19 @@ class CrayRedfishUtils(RedfishUtils):
 
         return {'ret': False, 'msg': 'Task polling timed out', 'state': last_state, 'percent': last_percent, 'progress_log': progress_log}
 
+    # Not every BMC/image type emits TargetDetermined specifically (observed
+    # with ACNA/BIOS packages) - also accept other Update.1.0.* progress
+    # messages that carry the component name as their first MessageArg.
+    _TARGET_MESSAGE_IDS = ("Update.1.0.TargetDetermined", "Update.1.0.TransferringToComponent",
+                           "Update.1.0.VerifyingAtComponent", "Update.1.0.ApplyingUpdateToComponent",
+                           "Update.1.0.UpdateSuccessful")
+
     def fetch_update_target_XD690(self, timeout_seconds=300, poll_interval=15):
             """
             Fetch the appropriate update target for XD690 systems.
-            Polls the task until the 'Update.1.0.TargetDetermined' message
-            appears or the task reaches a terminal state - a single
-            fixed-delay check missed this message on slower transfers.
+            Polls the task until one of _TARGET_MESSAGE_IDS appears or the
+            task reaches a terminal state - a single fixed-delay check missed
+            this message on slower transfers.
             Returns: update_target string or None
             """
             if not self._last_task_uri:
@@ -872,7 +919,7 @@ class CrayRedfishUtils(RedfishUtils):
                             continue
 
                         msg_id = msg.get('MessageId', '')
-                        if msg_id == "Update.1.0.TargetDetermined":
+                        if msg_id in self._TARGET_MESSAGE_IDS:
                             msg_args = msg.get('MessageArgs', [])
                             if msg_args and len(msg_args) > 0:
                                 return msg_args[0]
@@ -1000,33 +1047,23 @@ class CrayRedfishUtils(RedfishUtils):
                 # itself actually succeeded; on failure just report "NA" so a
                 # failed step never gets a misleading "pending_final_*" marker
                 # that never gets backfilled (the sequence stops on failure).
+                # A target name is only trusted as BMC/BIOS when it's an exact
+                # match to a real pre_inventory key - a fuzzy/unmatched name
+                # (raw_target echoed back by _resolve_canonical_target) falls
+                # through to the generic diff-based fallback below instead,
+                # regardless of upgrade vs downgrade.
                 target_name = (self.target or "").upper()
+                target_confirmed = bool(self.target) and self.target in pre_inventory
                 if update_status != "success":
                     after_version = "NA"
-                elif target_name == 'BMC':
-                    # BMC reboots after update - wait 5 minutes for it to come back.
-                    # Keep polling until the reported version actually differs from
-                    # before_version - the BMC can briefly keep reporting its old
-                    # cached version right after coming back, before its own
-                    # FirmwareInventory record catches up (see IRP-33191).
-                    time.sleep(300)
-                    after_version = "NA"
-                    for retry in range(10):
-                        ver = self.get_fw_version(self.target)
-                        if not ver.startswith("NA"):
-                            after_version = ver
-                            if ver != before_version:
-                                break
-                        time.sleep(30)
-                elif target_name in ('BIOS', 'BIOS2'):
-                    # BIOS PLDM update: after task reaches 100%, BMC automatically
-                    # performs DC cycle -> AC cycle -> flash recovery -> 2nd DC -> 2nd AC.
-                    # Defer that wait + version check to the end of the whole ordered
-                    # sequence instead of doing it per-step, so multiple firmware in
-                    # one run only go through this settle-and-reboot once.
-                    self._pending_reboot = True
-                    after_version = "pending_final_reboot"
-                elif target_name in CPLD_TARGETS:
+                elif target_confirmed and (target_name == 'BMC' or target_name in ('BIOS', 'BIOS2')):
+                    # Flash is already tracked to completion above. Settle for
+                    # 2 min, reboot via Redfish PowerCycle, then poll
+                    # FirmwareInventory (up to 30 min) until it reflects the new
+                    # version, or confirm a same-version reflash much sooner.
+                    after_version, self._last_version_confirmed = self._reboot_and_wait_for_version(self.target, before_version)
+                    self._already_rebooted = True
+                elif target_confirmed and target_name in CPLD_TARGETS:
                     # CPLD updates require an IPMI AC power cycle to activate.
                     # Defer the cycle + version check to the end of the whole
                     # ordered sequence instead of doing it per-step, so multiple
@@ -1049,12 +1086,40 @@ class CrayRedfishUtils(RedfishUtils):
                         before_version = {self.target: pre_inventory.get(self.target, "NA")}
                     self._pending_ac_cycle = True
                     after_version = "pending_final_ac_cycle"
+                elif not target_confirmed:
+                    # The target couldn't be trusted - either the BMC never
+                    # reported which component this task was for (self.target
+                    # is empty), or it reported a name that doesn't match any
+                    # real pre_inventory member (a fuzzy/unmatched echo from
+                    # _resolve_canonical_target). Applies equally to BMC or
+                    # BIOS, and to upgrades or downgrades - don't assume it's a
+                    # fast no-reboot target like PSU/PCIeSwitch below. Settle,
+                    # reboot, then diff the whole inventory against the
+                    # pre-flash snapshot for up to 30 min, resolving self.target
+                    # from whatever actually changed.
+                    time.sleep(120)
+                    self.AC_PC_redfish()
+                    before_version = {}
+                    after_version = "NA"
+                    deadline = time.time() + 1800
+                    while time.time() < deadline:
+                        post_resp = self.get_firmware_inventory_collection()
+                        post_inventory = post_resp.get('inventory') or {} if post_resp.get('ret') else {}
+                        changed = {name: ver for name, ver in post_inventory.items()
+                                   if pre_inventory.get(name, "NA") != ver}
+                        if changed:
+                            before_version = {name: pre_inventory.get(name, "NA") for name in changed}
+                            after_version = changed
+                            self.target = ",".join(sorted(changed.keys()))
+                            break
+                        time.sleep(30)
+                    self._already_rebooted = True
                 else:
-                    # Any remaining target - a single component (PSU, PCIeSwitch,
-                    # etc.) or an otherwise-unmapped bundle. Diff the whole
-                    # inventory before vs after so one path correctly reports
-                    # either a single changed component or several, with no
-                    # divergent behavior between the two cases.
+                    # Any remaining known target - a single component (PSU,
+                    # PCIeSwitch, etc.) or an otherwise-unmapped bundle. Diff
+                    # the whole inventory before vs after so one path correctly
+                    # reports either a single changed component or several,
+                    # with no divergent behavior between the two cases.
                     before_version = {}
                     after_version = "NA"
                     for retry in range(6):
@@ -1200,8 +1265,9 @@ class CrayRedfishUtils(RedfishUtils):
         total_steps = len(firmware_list)
         step_results = []
         all_succeeded = True
-        self._pending_reboot = False
+        self._already_rebooted = False
         self._pending_ac_cycle = False
+        self._last_version_confirmed = True
 
         for step, image_path in enumerate(firmware_list, start=1):
             result_data = {
@@ -1235,7 +1301,15 @@ class CrayRedfishUtils(RedfishUtils):
             result_data["task_uri"] = getattr(self, '_last_task_uri', '') or ""
 
             if update_status and update_status.lower() == "success":
-                result_data["message"] = f"[{step}/{total_steps}] {self.target} firmware successfully updated from {bef_ver} to {aft_ver}"
+                message = f"[{step}/{total_steps}] {self.target} firmware successfully updated from {bef_ver} to {aft_ver}"
+                if aft_ver == bef_ver and (self.target or "").upper() in ('BMC', 'BIOS', 'BIOS2'):
+                    # Same-version reflash - distinguish a confirmed settle from a timeout
+                    # that never got either a version change or a stable repeated read.
+                    if self._last_version_confirmed:
+                        message += " (already at this version - reflash confirmed after reboot)"
+                    else:
+                        message += " (version unchanged after timeout - may not have applied, or inventory hasn't refreshed yet)"
+                result_data["message"] = message
             else:
                 result_data["message"] = f"[{step}/{total_steps}] {self.target} firmware update failed with status: {update_status}"
 
@@ -1248,19 +1322,18 @@ class CrayRedfishUtils(RedfishUtils):
                 all_succeeded = False
                 break
 
-        # Perform the deferred BIOS/CPLD settle wait once, at the end of the
-        # whole ordered sequence, instead of once per BIOS/CPLD step. The
-        # actual reboot/ac_cycle action itself is decided further below by
-        # the power_state override (or the automatic default if it's NA).
+        # Perform the deferred CPLD/HGX settle wait once, at the end of the
+        # whole ordered sequence, instead of once per step. BMC/BIOS already
+        # rebooted and confirmed their own version per-step above. The actual
+        # ac_cycle action itself is decided further below by the power_state
+        # override (or the automatic default if it's NA).
         if all_succeeded and total_steps > 0:
-            if self._pending_reboot:
-                time.sleep(1800)  # 30 min for BMC's automatic power cycles to complete
             if self._pending_ac_cycle:
                 time.sleep(120)  # let BMC settle after the last CPLD update
 
             # Backfill fw_version_after for every step that deferred its check
             for result_data in step_results:
-                if result_data.get("fw_version_after") not in ("pending_final_reboot", "pending_final_ac_cycle"):
+                if result_data.get("fw_version_after") != "pending_final_ac_cycle":
                     continue
                 before = result_data.get("fw_version_before")
                 confirmed_changed = False
@@ -1306,6 +1379,10 @@ class CrayRedfishUtils(RedfishUtils):
                     # BMC still hasn't refreshed its inventory. Flag it so this
                     # isn't silently indistinguishable from a real update (IRP-33191).
                     result_data["message"] += " (version unchanged after retries - may already be at this version, or BMC inventory has not refreshed yet)"
+                if isinstance(before, dict):
+                    # GPU/HGX firmware - this log only tracks system firmware, so
+                    # point the user at the dedicated GPU inventory check to confirm.
+                    result_data["message"] += " AC cycle performed to apply this update; run get_gpu_inventory.yml to confirm the GPU firmware inventory."
                 self._append_to_json_log(output_file_name, result_data)
 
         # Final power action once the whole ordered sequence has completed
@@ -1326,11 +1403,14 @@ class CrayRedfishUtils(RedfishUtils):
                 self.ac_cycle_ipmi(IP, username, password)
             else:
                 # NA / unset - automatic default: AC-cycle once if any CPLD
-                # was flashed, then always reboot so everything takes effect.
+                # was flashed, then reboot so everything takes effect - unless
+                # a BMC/BIOS step already rebooted the system above.
                 if self._pending_ac_cycle:
                     self.ac_cycle_ipmi(IP, username, password)
                     time.sleep(180)  # let the system recover after the AC cycle
-                self.AC_PC_redfish()
+                    self.AC_PC_redfish()
+                elif not self._already_rebooted:
+                    self.AC_PC_redfish()
 
         restore_result = None
         if all_succeeded and total_steps > 0 and restore_bmc_to_default:
